@@ -1,5 +1,7 @@
 # Personal AI Chief of Staff
 
+![Personal AI Chief of Staff — private Telegram inbox for tasks and reminders](assets/banner.svg)
+
 Личный Telegram inbox для задач, заметок и напоминаний. Данные остаются в локальной SQLite базе, а доступ к боту ограничен списком Telegram user ID.
 
 [![CI](https://github.com/jezannn16/personal-ai-chief-of-staff/actions/workflows/ci.yml/badge.svg)](https://github.com/jezannn16/personal-ai-chief-of-staff/actions/workflows/ci.yml)
