@@ -1,0 +1,24 @@
+[project]
+name = "chief-of-staff"
+version = "0.1.0"
+description = "A private Telegram task inbox with persistent reminders"
+requires-python = ">=3.11"
+dependencies = ["aiogram>=3.13,<4", "python-dotenv>=1,<2"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+chief-of-staff = "chief_of_staff.bot:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
