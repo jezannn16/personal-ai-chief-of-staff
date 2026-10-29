@@ -171,7 +171,10 @@ def create_app(token: str, allowlist: set[int], store: Store) -> tuple[Bot, Disp
                     store.finish_reminder(row["id"],False,type(exc).__name__)
             await asyncio.sleep(30)
 
-    dp.startup.register(lambda: asyncio.create_task(reminder_loop()))
+    async def start_reminder_loop() -> None:
+        asyncio.create_task(reminder_loop())
+
+    dp.startup.register(start_reminder_loop)
     return bot,dp
 
 
