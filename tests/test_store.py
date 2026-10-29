@@ -49,3 +49,17 @@ def test_reminder_claim_is_single_delivery(tmp_path):
     assert not store.claim_reminder(reminder["id"],5)
     store.finish_reminder(reminder["id"],True)
     assert store.due_reminders(datetime.now(UTC))==[]
+
+
+def test_reminders_are_user_scoped_and_cancel_is_idempotent(tmp_path):
+    store = Store(tmp_path / "db.sqlite3")
+    task_id = store.add_task(5, "Synthetic reminder", datetime(2030, 1, 1, tzinfo=UTC))
+    reminder_id = store.reminders(5)[0]["id"]
+    assert store.reminders(6) == []
+    assert store.cancel_reminder(6, reminder_id) is False
+    assert store.cancel_reminder(5, reminder_id) is True
+    assert store.cancel_reminder(5, reminder_id) is False
+    assert store.reminders(5) == []
+    with store._connect() as db:
+        row = db.execute("SELECT state FROM reminders WHERE task_id=?", (task_id,)).fetchone()
+    assert row["state"] == "cancelled"

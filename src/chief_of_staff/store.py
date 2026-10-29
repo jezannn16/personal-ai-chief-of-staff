@@ -144,6 +144,26 @@ class Store:
         with self._connect() as db:
             return list(db.execute("SELECT r.*,t.title,s.timezone,s.quiet_start,s.quiet_end FROM reminders r JOIN tasks t ON t.id=r.task_id LEFT JOIN user_settings s ON s.user_id=r.user_id WHERE r.state='pending' AND r.due_at<=? AND t.status='open' ORDER BY r.due_at", (now.astimezone(UTC).isoformat(),)))
 
+    def reminders(self, user_id: int, include_finished: bool = False) -> list[sqlite3.Row]:
+        """List reminders belonging to one user, with task state included for display."""
+        query = """SELECT r.id,r.task_id,r.due_at,r.state,r.attempts,r.last_error,t.title
+                   FROM reminders r JOIN tasks t ON t.id=r.task_id
+                   WHERE r.user_id=?"""
+        if not include_finished:
+            query += " AND r.state IN ('pending','sending')"
+        query += " ORDER BY r.due_at,r.id"
+        with self._connect() as db:
+            return list(db.execute(query, (user_id,)))
+
+    def cancel_reminder(self, user_id: int, reminder_id: int) -> bool:
+        """Cancel a pending reminder. Repeated and cross-user cancellation is harmless."""
+        with self._connect() as db:
+            cur = db.execute(
+                "UPDATE reminders SET state='cancelled' WHERE id=? AND user_id=? AND state='pending'",
+                (reminder_id, user_id),
+            )
+            return bool(cur.rowcount)
+
     def claim_reminder(self, reminder_id: int, user_id: int) -> bool:
         """Atomically claim one reminder; a claimed item is never auto-retried (at-most-once)."""
         with self._connect() as db:

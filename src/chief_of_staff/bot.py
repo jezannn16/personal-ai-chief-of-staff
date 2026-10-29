@@ -37,7 +37,7 @@ def create_app(token: str, allowlist: set[int], store: Store) -> tuple[Bot, Disp
     @dp.message(Command("help"))
     async def help_cmd(message: Message) -> None:
         if await allowed(message):
-            await message.answer("/add текст задачи | /add YYYY-MM-DD HH:MM | задача\n/note текст #тег\n/today, /inbox, /done ID, /search слова, /briefing\n/timezone Europe/Moscow\n/quiet 23 8")
+            await message.answer("/add текст задачи | /add YYYY-MM-DD HH:MM | задача\n/note текст #тег\n/today, /inbox, /done ID, /search слова, /briefing\n/reminders, /cancelreminder ID\n/timezone Europe/Moscow\n/quiet 23 8")
 
     @dp.message(Command("add"))
     async def add(message: Message) -> None:
@@ -128,6 +128,38 @@ def create_app(token: str, allowlist: set[int], store: Store) -> tuple[Bot, Disp
         try: store.set_quiet_hours(message.from_user.id,int(parts[1]),int(parts[2]))
         except ValueError as exc: await message.answer(str(exc));return
         await message.answer(f"Тихие часы установлены: {parts[1]}:00–{parts[2]}:00 по вашей timezone.")
+
+    @dp.message(Command("reminders"))
+    async def reminders(message: Message) -> None:
+        if not await allowed(message):
+            return
+        uid = message.from_user.id
+        rows = store.reminders(uid)
+        tz = ZoneInfo(store.get_timezone(uid))
+        if not rows:
+            await message.answer("Активных напоминаний нет.")
+            return
+        lines = [
+            f"#{row['id']} задача #{row['task_id']}: {row['title']} — "
+            f"{datetime.fromisoformat(row['due_at']).astimezone(tz).strftime('%Y-%m-%d %H:%M %Z')}"
+            for row in rows[:30]
+        ]
+        await message.answer("Напоминания (отмена: /cancelreminder ID):\n" + "\n".join(lines))
+
+    @dp.message(Command("cancelreminder"))
+    async def cancel_reminder(message: Message) -> None:
+        if not await allowed(message):
+            return
+        arg = (message.text or "").partition(" ")[2].strip()
+        try:
+            reminder_id = int(arg)
+        except ValueError:
+            await message.answer("Укажите ID напоминания: /cancelreminder 12")
+            return
+        changed = store.cancel_reminder(message.from_user.id, reminder_id)
+        await message.answer(
+            "Напоминание отменено." if changed else "Активное напоминание с таким ID не найдено."
+        )
 
     @dp.message(Command("briefing"))
     async def briefing(message: Message) -> None:
