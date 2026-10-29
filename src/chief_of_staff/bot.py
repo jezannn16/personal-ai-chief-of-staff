@@ -6,7 +6,7 @@ import os
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, Dispatcher
+from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
 from aiogram.types import Message
@@ -147,6 +147,19 @@ def create_app(token: str, allowlist: set[int], store: Store) -> tuple[Bot, Disp
             out.append(label+":"+("\n"+"\n".join(format_task(x, store.get_timezone(uid)) for x in items) if items else " нет"))
         if notes: out.append("Заметки:\n"+"\n".join(f"#{n['id']} {n['body']}" for n in notes))
         await message.answer("\n\n".join(out))
+
+    @dp.message(F.text & ~F.text.startswith("/"))
+    async def add_plain_text(message: Message) -> None:
+        """Treat an ordinary message as a task, keeping slash commands explicit."""
+        if not await allowed(message):
+            return
+        text = (message.text or "").strip()
+        try:
+            task_id = store.add_task(message.from_user.id, text)
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+        await message.answer(f"Добавлено: #{task_id} {text}")
 
     async def reminder_loop() -> None:
         while True:
