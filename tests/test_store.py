@@ -25,6 +25,22 @@ def test_notes_search_and_restart(tmp_path):
     assert tasks==[] and notes[0]["tags"]=="work"
 
 
+def test_shared_memory_database_survives_store_method_connections():
+    store=Store(":memory:")
+    store.add_task(7,"in-memory task")
+    store.add_note(7,"in-memory note")
+    assert store.tasks(7)[0]["title"]=="in-memory task"
+    assert store.search(7,"in-memory")[1][0]["body"]=="in-memory note"
+
+
+def test_shared_memory_store_serializes_concurrent_connections():
+    store=Store(":memory:")
+    with ThreadPoolExecutor(max_workers=12) as pool:
+        ids=list(pool.map(lambda i:store.add_task(7,f"task-{i}"),range(60)))
+    assert len(set(ids))==60
+    assert len(store.tasks(7))==60
+
+
 def test_invalid_values(tmp_path):
     store=Store(tmp_path/"db.sqlite3")
     with pytest.raises(ValueError): store.add_task(1," ")
@@ -158,3 +174,4 @@ def test_delivery_history_is_scoped_ordered_bounded_and_survives_restart(tmp_pat
     assert len(Store(path).reminder_history(5, limit=1)) == 1
     with pytest.raises(ValueError, match="between 1 and 100"):
         store.reminder_history(5, limit=0)
+from concurrent.futures import ThreadPoolExecutor

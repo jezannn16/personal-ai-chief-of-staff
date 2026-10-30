@@ -12,6 +12,7 @@ from chief_of_staff.bot import (
     deliver_daily_briefing,
     main,
     parse_task_command,
+    resolve_local_datetime,
 )
 from chief_of_staff.store import Store
 
@@ -20,6 +21,16 @@ def test_task_cli_parser_supports_project_and_priority():
     assert parse_task_command('--project "Interview prep" --priority 3 Prepare notes') == ("Prepare notes", "Interview prep", 3)
     assert parse_task_command("Plain task")==("Plain task",None,0)
     with pytest.raises(ValueError):parse_task_command("--priority 4 Invalid")
+
+
+def test_local_wall_time_rejects_dst_gap_and_fold_but_accepts_unambiguous_time():
+    from datetime import datetime
+
+    assert resolve_local_datetime(datetime(2026, 3, 29, 1, 30), "Europe/Berlin").utcoffset().total_seconds() == 3600
+    with pytest.raises(ValueError, match="does not exist"):
+        resolve_local_datetime(datetime(2026, 3, 29, 2, 30), "Europe/Berlin")
+    with pytest.raises(ValueError, match="occurs twice"):
+        resolve_local_datetime(datetime(2026, 10, 25, 2, 30), "Europe/Berlin")
 
 
 def test_bot_help_exits_before_loading_credentials_or_polling(monkeypatch, capsys):
@@ -137,6 +148,35 @@ def test_plain_text_update_creates_persistent_task(tmp_path):
             assert len(rows) == 1
             assert rows[0]["title"] == "Тестовая задача Codex"
             assert rows[0]["status"] == "open"
+        finally:
+            await bot.session.close()
+
+    asyncio.run(run_update())
+
+
+def test_add_rejects_nonexistent_local_reminder_time_without_mutating_store(tmp_path):
+    async def run_update():
+        store = Store(tmp_path / "dst-gap.sqlite3")
+        store.set_timezone(42, "Europe/Berlin")
+        bot, dispatcher = create_app(
+            "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi", {42}, store
+        )
+        update = Update(
+            update_id=1,
+            message=Message(
+                message_id=7,
+                date=datetime.now(UTC),
+                chat=Chat(id=42, type="private"),
+                from_user=User(id=42, is_bot=False, first_name="Test"),
+                text="/add 2026-03-29 02:30 | Synthetic task",
+            ),
+        )
+        try:
+            with patch("aiogram.client.bot.Bot.__call__", new_callable=AsyncMock) as telegram:
+                await dispatcher.feed_update(bot, update)
+            assert "пропущенные или повторяющиеся часы" in telegram.await_args.args[0].text
+            assert store.tasks(42) == []
+            assert store.reminders(42) == []
         finally:
             await bot.session.close()
 

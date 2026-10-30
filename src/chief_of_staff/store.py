@@ -3,25 +3,39 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import uuid
+from contextlib import contextmanager, nullcontext
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from threading import RLock
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 class Store:
     def __init__(self, path: str | Path):
         self.path = str(path)
+        self._memory_uri = f"file:chief-{uuid.uuid4().hex}?mode=memory&cache=shared" if self.path == ":memory:" else None
+        self._memory_anchor = sqlite3.connect(self._memory_uri, uri=True) if self._memory_uri else None
+        self._memory_lock = RLock() if self._memory_uri else None
         self._init_db()
 
-    def _connect(self) -> sqlite3.Connection:
-        if self.path != ":memory:":
-            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
-            os.close(fd)
-        db = sqlite3.connect(self.path, timeout=10)
-        self._secure_database_permissions()
-        db.row_factory = sqlite3.Row
-        db.execute("PRAGMA foreign_keys = ON")
-        return db
+    @contextmanager
+    def _connect(self):
+        # Shared-cache memory databases return SQLITE_LOCKED immediately, so
+        # serialize operations made through separate connections to this store.
+        with self._memory_lock if self._memory_lock else nullcontext():
+            if self.path != ":memory:":
+                fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+                os.close(fd)
+            db = sqlite3.connect(self._memory_uri or self.path, timeout=10, uri=bool(self._memory_uri))
+            try:
+                self._secure_database_permissions()
+                db.row_factory = sqlite3.Row
+                db.execute("PRAGMA foreign_keys = ON")
+                with db:
+                    yield db
+            finally:
+                db.close()
 
     def _secure_database_permissions(self) -> None:
         if self.path == ":memory:":

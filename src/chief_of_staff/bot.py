@@ -29,6 +29,23 @@ def format_task(row, timezone_name: str = "UTC") -> str:
     return f"#{row['id']} {row['title']}{due}"
 
 
+def resolve_local_datetime(value: datetime, timezone_name: str) -> datetime:
+    """Attach an IANA timezone only when the local wall time maps to one instant."""
+    if value.tzinfo is not None:
+        raise ValueError("Expected a timezone-naive local date and time")
+    zone = ZoneInfo(timezone_name)
+    candidates = [value.replace(tzinfo=zone, fold=fold) for fold in (0, 1)]
+    valid = [
+        candidate for candidate in candidates
+        if candidate.astimezone(UTC).astimezone(zone).replace(tzinfo=None) == value
+    ]
+    if not valid:
+        raise ValueError("Local time does not exist because of a timezone clock change")
+    if len(valid) == 2 and valid[0].utcoffset() != valid[1].utcoffset():
+        raise ValueError("Local time occurs twice because of a timezone clock change")
+    return valid[0]
+
+
 def briefing_due_date(now: datetime, timezone_name: str, send_hour: int) -> str | None:
     if now.tzinfo is None:
         raise ValueError("Clock must be timezone-aware")
@@ -140,10 +157,10 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
         if " | " in text:
             when, text = text.split(" | ",1)
             try:
-                local = datetime.strptime(when.strip(), "%Y-%m-%d %H:%M").replace(tzinfo=ZoneInfo(store.get_timezone(message.from_user.id)))
-                due = local
+                local = datetime.strptime(when.strip(), "%Y-%m-%d %H:%M")
+                due = resolve_local_datetime(local, store.get_timezone(message.from_user.id))
             except ValueError:
-                await message.answer("Дата должна быть в формате YYYY-MM-DD HH:MM и существовать в вашей timezone.")
+                await message.answer("Дата должна существовать в вашей timezone и однозначно задавать время; пропущенные или повторяющиеся часы при переводе времени не принимаются.")
                 return
         try:
             task_id = store.add_task(message.from_user.id, text, due,project,priority)
