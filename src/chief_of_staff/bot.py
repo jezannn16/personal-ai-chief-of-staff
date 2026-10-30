@@ -2,10 +2,11 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import os
 import shlex
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, Dispatcher, F
@@ -14,6 +15,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
+from .calendar import CalendarError, CalendarProvider, configure_calendar_provider
 from .intent import Intent, IntentError, IntentProvider, OpenAIIntentProvider, validate_intent
 from .store import Store
 
@@ -73,7 +75,9 @@ async def deliver_daily_briefing(bot: Bot, store: Store, user_id: int, now: date
     if local_date is None or not store.claim_daily_briefing(user_id, local_date):
         return False
     try:
-        await bot.send_message(user_id, render(user_id, now))
+        text=render(user_id, now)
+        if inspect.isawaitable(text):text=await text
+        await bot.send_message(user_id, text)
     except (TimeoutError, TelegramAPIError, OSError):
         store.finish_daily_briefing(user_id, local_date, False)
         return False
@@ -81,8 +85,22 @@ async def deliver_daily_briefing(bot: Bot, store: Store, user_id: int, now: date
     return True
 
 
+async def send_reminder_with_rate_limit_retry(bot, user_id: int, text: str,
+                                             max_attempts: int = 3) -> None:
+    """Retry only Telegram's explicit 429 rejection; ambiguous network sends are never repeated."""
+    for attempt in range(max_attempts):
+        try:
+            await bot.send_message(user_id,text)
+            return
+        except TelegramRetryAfter as exc:
+            if attempt + 1 >= max_attempts or exc.retry_after > 60:
+                raise
+            await asyncio.sleep(exc.retry_after)
+
+
 def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int = 8,
-               intent_provider: IntentProvider | None = None) -> tuple[Bot, Dispatcher]:
+               intent_provider: IntentProvider | None = None,
+               calendar_provider: CalendarProvider | None = None) -> tuple[Bot, Dispatcher]:
     if not 0 <= briefing_hour <= 23:
         raise ValueError("Briefing hour must be between 0 and 23")
     bot, dp = Bot(token=token), Dispatcher()
@@ -265,10 +283,21 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
         if recent_notes: out.append("Последние заметки:\n"+"\n".join(f"#{n['id']} {n['body']}" for n in recent_notes))
         return "\n\n".join(out)
 
+    async def render_briefing_with_calendar(uid: int, now: datetime) -> str:
+        result=render_briefing(uid,now)
+        if calendar_provider is None:return result
+        timezone_name=store.get_timezone(uid);tz=ZoneInfo(timezone_name);local_now=now.astimezone(tz)
+        start=local_now.replace(hour=0,minute=0,second=0,microsecond=0);end=start+timedelta(days=1)
+        try:events=await asyncio.to_thread(calendar_provider.events_between,start,end,timezone_name)
+        except CalendarError:
+            return result+"\n\nКалендарь временно недоступен; сводка показана без событий календаря."
+        calendar_lines=[f"{event.starts_at} — {event.title}" for event in events[:30]]
+        return result+"\n\nКалендарь:"+("\n"+"\n".join(calendar_lines) if calendar_lines else " событий нет")
+
     @dp.message(Command("briefing"))
     async def briefing(message: Message) -> None:
         if not await allowed(message): return
-        await message.answer(render_briefing(message.from_user.id, datetime.now(UTC)))
+        await message.answer(await render_briefing_with_calendar(message.from_user.id, datetime.now(UTC)))
 
     @dp.message(Command("ai"))
     async def ai_intent(message: Message) -> None:
@@ -372,18 +401,12 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
                 if quiet: continue
                 if not store.claim_reminder(row["id"],row["user_id"]): continue
                 try:
-                    for attempt in range(3):
-                        try:
-                            await bot.send_message(row["user_id"],f"⏰ Напоминание: {row['title']} (задача #{row['task_id']})")
-                            break
-                        except TelegramRetryAfter as exc:
-                            if attempt==2 or exc.retry_after>60: raise
-                            await asyncio.sleep(exc.retry_after)
+                    await send_reminder_with_rate_limit_retry(bot,row["user_id"],f"⏰ Напоминание: {row['title']} (задача #{row['task_id']})")
                     store.finish_reminder(row["id"],True)
                 except (TimeoutError, TelegramAPIError, OSError) as exc:  # no retry after an uncertain delivery result
                     store.finish_reminder(row["id"],False,type(exc).__name__)
             for user_id in allowlist:
-                await deliver_daily_briefing(bot,store,user_id,now,briefing_hour,render_briefing)
+                await deliver_daily_briefing(bot,store,user_id,now,briefing_hour,render_briefing_with_calendar)
             await asyncio.sleep(30)
 
     async def start_reminder_loop() -> None:
@@ -411,7 +434,11 @@ def main() -> None:
         provider=configure_intent_provider(os.getenv("OPENAI_ENABLED", "false"),os.getenv("OPENAI_API_KEY", ""),os.getenv("OPENAI_MODEL", ""))
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
-    bot,dp=create_app(token,allowed,store,briefing_hour,provider)
+    try:
+        calendar=configure_calendar_provider(os.getenv("CALENDAR_ENABLED", "false"),os.getenv("GOOGLE_CALENDAR_ACCESS_TOKEN", ""),os.getenv("GOOGLE_CALENDAR_ID", "primary"))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    bot,dp=create_app(token,allowed,store,briefing_hour,provider,calendar)
     asyncio.run(dp.start_polling(bot))
 
 

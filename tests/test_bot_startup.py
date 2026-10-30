@@ -42,6 +42,35 @@ def test_telegram_can_set_task_metadata_and_important_notes(tmp_path):
     asyncio.run(scenario())
 
 
+def test_optional_calendar_is_in_briefing_and_failure_preserves_baseline(tmp_path):
+    from chief_of_staff.calendar import CalendarError, CalendarEvent
+
+    class FakeCalendar:
+        def __init__(self,fail=False):self.calls=[];self.fail=fail
+        def events_between(self,start,end,timezone_name):
+            self.calls.append((start,end,timezone_name))
+            if self.fail:raise CalendarError("synthetic provider failure")
+            return [CalendarEvent("Synthetic meeting","2026-10-30 09:00 MSK")]
+
+    async def run_case(provider,update_id):
+        store=Store(tmp_path/f"calendar-{update_id}.sqlite3")
+        store.set_timezone(71,"Europe/Moscow")
+        bot,dispatcher=create_app("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",{71},store,calendar_provider=provider)
+        message=Message(message_id=update_id,date=datetime.now(UTC),chat=Chat(id=71,type="private"),from_user=User(id=71,is_bot=False,first_name="Test"),text="/briefing")
+        try:
+            with patch("aiogram.client.bot.Bot.__call__",new_callable=AsyncMock) as telegram:
+                await dispatcher.feed_update(bot,Update(update_id=update_id,message=message))
+                return telegram.await_args.args[0].text
+        finally:await bot.session.close()
+
+    good=FakeCalendar()
+    text=asyncio.run(run_case(good,11))
+    assert "Календарь:" in text and "Synthetic meeting" in text
+    assert good.calls[0][0].tzinfo is not None and good.calls[0][2]=="Europe/Moscow"
+    failed=asyncio.run(run_case(FakeCalendar(fail=True),12))
+    assert "Просрочено:" in failed and "Календарь временно недоступен" in failed
+
+
 def test_startup_schedules_reminder_loop(tmp_path):
     async def run_startup():
         bot, dispatcher = create_app(
@@ -171,3 +200,33 @@ def test_uncertain_daily_briefing_send_is_not_repeated(tmp_path):
     with store._connect() as db:
         row=db.execute("SELECT state FROM daily_briefing_delivery WHERE user_id=52 AND local_date='2026-10-30'").fetchone()
     assert row["state"]=="failed"
+
+
+def test_reminder_retries_explicit_retry_after_but_never_retries_uncertain_send():
+    from chief_of_staff import bot as bot_module
+
+    class ExplicitRetryAfter(Exception):
+        retry_after=0
+
+    class RateLimitedBot:
+        def __init__(self):self.calls=0
+        async def send_message(self,*_args):
+            self.calls+=1
+            if self.calls==1:raise ExplicitRetryAfter()
+
+    class UncertainBot:
+        def __init__(self):self.calls=0
+        async def send_message(self,*_args):
+            self.calls+=1
+            raise TimeoutError("delivery status unknown")
+
+    async def scenario():
+        with patch.object(bot_module,"TelegramRetryAfter",ExplicitRetryAfter), patch.object(bot_module.asyncio,"sleep",new_callable=AsyncMock) as sleep:
+            limited=RateLimitedBot()
+            await bot_module.send_reminder_with_rate_limit_retry(limited,1,"synthetic reminder")
+            assert limited.calls==2 and sleep.await_count==1
+            uncertain=UncertainBot()
+            with pytest.raises(TimeoutError):await bot_module.send_reminder_with_rate_limit_retry(uncertain,1,"synthetic reminder")
+            assert uncertain.calls==1
+
+    asyncio.run(scenario())
