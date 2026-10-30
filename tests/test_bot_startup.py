@@ -244,3 +244,35 @@ def test_reminder_retries_explicit_retry_after_but_never_retries_uncertain_send(
             assert uncertain.calls==1
 
     asyncio.run(scenario())
+
+
+def test_reminders_history_command_shows_recent_user_scoped_delivery(tmp_path):
+    async def scenario():
+        store = Store(tmp_path / "reminder-history.sqlite3")
+        task_id = store.add_task(73, "Synthetic renewal", datetime(2030, 1, 1, tzinfo=UTC))
+        reminder = store.reminders(73)[0]
+        assert store.claim_reminder(reminder["id"], 73)
+        store.finish_reminder(reminder["id"], False, "TelegramRetryAfter")
+        store.add_task(74, "Another user's private item", datetime(2030, 1, 2, tzinfo=UTC))
+        bot, dispatcher = create_app(
+            "123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi", {73, 74}, store
+        )
+        message = Message(
+            message_id=1,
+            date=datetime.now(UTC),
+            chat=Chat(id=73, type="private"),
+            from_user=User(id=73, is_bot=False, first_name="Test"),
+            text="/reminders history",
+        )
+        try:
+            with patch("aiogram.client.bot.Bot.__call__", new_callable=AsyncMock) as telegram:
+                await dispatcher.feed_update(bot, Update(update_id=1, message=message))
+            answer = telegram.await_args.args[0].text
+            assert "Последние попытки доставки" in answer
+            assert f"#{reminder['id']} задача #{task_id}: Synthetic renewal" in answer
+            assert "ошибка" in answer and "TelegramRetryAfter" in answer
+            assert "Another user's private item" not in answer
+        finally:
+            await bot.session.close()
+
+    asyncio.run(scenario())

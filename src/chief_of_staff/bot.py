@@ -124,7 +124,7 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
     @dp.message(Command("help"))
     async def help_cmd(message: Message) -> None:
         if await allowed(message):
-            await message.answer("/add [--project название] [--priority 0..3] текст задачи\n/add YYYY-MM-DD HH:MM | задача\n/note [--important] текст #тег\n/note-important ID on|off\n/ai <запрос> — optional LLM preview; изменения только после подтверждения\n/today, /inbox, /done ID, /search слова, /briefing\n/reminders, /cancelreminder ID\n/timezone Europe/Moscow\n/quiet 23 8")
+            await message.answer("/add [--project название] [--priority 0..3] текст задачи\n/add YYYY-MM-DD HH:MM | задача\n/note [--important] текст #тег\n/note-important ID on|off\n/ai <запрос> — optional LLM preview; изменения только после подтверждения\n/today, /inbox, /done ID, /search слова, /briefing\n/reminders [history], /cancelreminder ID\n/timezone Europe/Moscow\n/quiet 23 8")
 
     @dp.message(Command("add"))
     async def add(message: Message) -> None:
@@ -237,6 +237,28 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
         if not await allowed(message):
             return
         uid = message.from_user.id
+        argument = (message.text or "").partition(" ")[2].strip().lower()
+        if argument:
+            if argument != "history":
+                await message.answer("Формат: /reminders или /reminders history")
+                return
+            rows = store.reminder_history(uid, limit=10)
+            if not rows:
+                await message.answer("История доставки напоминаний пока пуста.")
+                return
+            tz = ZoneInfo(store.get_timezone(uid))
+            status_labels = {"sent": "доставлено", "failed": "ошибка", "unknown": "результат неизвестен"}
+            lines = []
+            for row in rows:
+                attempted = datetime.fromisoformat(row["attempted_at"]).astimezone(tz)
+                detail = f" — {row['detail']}" if row["detail"] else ""
+                lines.append(
+                    f"{attempted.strftime('%Y-%m-%d %H:%M %Z')} · "
+                    f"#{row['reminder_id']} задача #{row['task_id']}: {row['title']} · "
+                    f"{status_labels.get(row['outcome'], row['outcome'])}{detail}"
+                )
+            await message.answer("Последние попытки доставки:\n" + "\n".join(lines))
+            return
         rows = store.reminders(uid)
         tz = ZoneInfo(store.get_timezone(uid))
         if not rows:

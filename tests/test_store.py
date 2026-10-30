@@ -127,3 +127,34 @@ def test_reminders_are_user_scoped_and_cancel_is_idempotent(tmp_path):
     with store._connect() as db:
         row = db.execute("SELECT state FROM reminders WHERE task_id=?", (task_id,)).fetchone()
     assert row["state"] == "cancelled"
+
+
+def test_delivery_history_is_scoped_ordered_bounded_and_survives_restart(tmp_path):
+    path = tmp_path / "history.sqlite3"
+    store = Store(path)
+    first_task = store.add_task(5, "First synthetic reminder", datetime(2030, 1, 1, tzinfo=UTC))
+    first = store.reminders(5)[0]
+    assert store.claim_reminder(first["id"], 5)
+    store.finish_reminder(first["id"], True)
+    second_task = store.add_task(5, "Second synthetic reminder", datetime(2030, 1, 2, tzinfo=UTC))
+    second = store.reminders(5)[0]
+    assert second["task_id"] == second_task
+    assert store.claim_reminder(second["id"], 5)
+    store.finish_reminder(second["id"], False, "TelegramRetryAfter")
+
+    other_task = store.add_task(6, "Private reminder", datetime(2030, 1, 3, tzinfo=UTC))
+    other = store.reminders(6)[0]
+    assert other["task_id"] == other_task
+    assert store.claim_reminder(other["id"], 6)
+    store.finish_reminder(other["id"], True)
+
+    history = Store(path).reminder_history(5)
+    assert [(row["task_id"], row["outcome"]) for row in history] == [
+        (second_task, "failed"), (first_task, "sent")
+    ]
+    assert [row["title"] for row in history] == [
+        "Second synthetic reminder", "First synthetic reminder"
+    ]
+    assert len(Store(path).reminder_history(5, limit=1)) == 1
+    with pytest.raises(ValueError, match="between 1 and 100"):
+        store.reminder_history(5, limit=0)

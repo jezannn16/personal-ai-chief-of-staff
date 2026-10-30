@@ -184,6 +184,22 @@ class Store:
         with self._connect() as db:
             return list(db.execute(query, (user_id,)))
 
+    def reminder_history(self, user_id: int, limit: int = 10) -> list[sqlite3.Row]:
+        """Return recent delivery attempts for one user without exposing other users' tasks."""
+        if not 1 <= limit <= 100:
+            raise ValueError("History limit must be between 1 and 100")
+        with self._connect() as db:
+            return list(db.execute(
+                """SELECT r.id AS reminder_id,r.task_id,r.due_at,t.title,
+                          l.attempted_at,l.outcome,l.detail
+                   FROM reminder_delivery_log l
+                   JOIN reminders r ON r.id=l.reminder_id
+                   JOIN tasks t ON t.id=r.task_id
+                   WHERE r.user_id=?
+                   ORDER BY l.id DESC LIMIT ?""",
+                (user_id, limit),
+            ))
+
     def cancel_reminder(self, user_id: int, reminder_id: int) -> bool:
         """Cancel a pending reminder. Repeated and cross-user cancellation is harmless."""
         with self._connect() as db:
