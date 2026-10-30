@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
@@ -9,6 +10,7 @@ from chief_of_staff.bot import (
     briefing_due_date,
     create_app,
     deliver_daily_briefing,
+    main,
     parse_task_command,
 )
 from chief_of_staff.store import Store
@@ -18,6 +20,18 @@ def test_task_cli_parser_supports_project_and_priority():
     assert parse_task_command('--project "Interview prep" --priority 3 Prepare notes') == ("Prepare notes", "Interview prep", 3)
     assert parse_task_command("Plain task")==("Plain task",None,0)
     with pytest.raises(ValueError):parse_task_command("--priority 4 Invalid")
+
+
+def test_bot_help_exits_before_loading_credentials_or_polling(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["chief-of-staff", "--help"])
+    monkeypatch.setattr(
+        "chief_of_staff.bot.load_dotenv",
+        lambda: pytest.fail("--help must not load credentials or start the bot"),
+    )
+    with pytest.raises(SystemExit) as result:
+        main()
+    assert result.value.code == 0
+    assert "Telegram bot" in capsys.readouterr().out
 
 
 def test_telegram_can_set_task_metadata_and_important_notes(tmp_path):

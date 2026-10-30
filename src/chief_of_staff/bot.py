@@ -1,6 +1,7 @@
 """aiogram entry point; domain and access control remain in Store."""
 from __future__ import annotations
 
+import argparse
 import asyncio
 import inspect
 import os
@@ -417,6 +418,8 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
 
 
 def main() -> None:
+    parser=argparse.ArgumentParser(description="Personal AI Chief of Staff Telegram bot")
+    parser.parse_args()
     load_dotenv()
     token=os.getenv("TELEGRAM_BOT_TOKEN","").strip()
     allowed={int(v) for v in os.getenv("ALLOWED_USER_IDS","").split(",") if v.strip().isdigit()}
