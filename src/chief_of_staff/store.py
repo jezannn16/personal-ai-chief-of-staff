@@ -69,6 +69,10 @@ class Store:
             if "attempt_started_at" not in columns:
                 db.execute("ALTER TABLE reminders ADD COLUMN attempt_started_at TEXT")
             db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
+            note_columns = {row[1] for row in db.execute("PRAGMA table_info(notes)")}
+            if "important" not in note_columns:
+                db.execute("ALTER TABLE notes ADD COLUMN important INTEGER NOT NULL DEFAULT 0")
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,CURRENT_TIMESTAMP)")
 
     @staticmethod
     def now() -> str:
@@ -130,14 +134,20 @@ class Store:
                 db.execute("INSERT INTO reminders(user_id,task_id,due_at) VALUES(?,?,?)", (user_id,task_id,utc_due))
         return task_id
 
-    def add_note(self, user_id: int, body: str, tags: list[str] | None = None) -> int:
+    def add_note(self, user_id: int, body: str, tags: list[str] | None = None,
+                 important: bool = False) -> int:
         body = body.strip()
         if not body:
             raise ValueError("Note cannot be empty")
         clean_tags = sorted({t.strip().lstrip("#").lower() for t in (tags or []) if t.strip()})
         with self._connect() as db:
-            cur = db.execute("INSERT INTO notes(user_id,body,tags,created_at) VALUES(?,?,?,?)", (user_id,body,",".join(clean_tags),self.now()))
+            cur = db.execute("INSERT INTO notes(user_id,body,tags,created_at,important) VALUES(?,?,?,?,?)", (user_id,body,",".join(clean_tags),self.now(),int(important)))
             return int(cur.lastrowid)
+
+    def set_note_important(self, user_id: int, note_id: int, important: bool) -> bool:
+        with self._connect() as db:
+            cur = db.execute("UPDATE notes SET important=? WHERE id=? AND user_id=?", (int(important),note_id,user_id))
+            return bool(cur.rowcount)
 
     def complete(self, user_id: int, task_id: int) -> bool:
         with self._connect() as db:
@@ -154,7 +164,7 @@ class Store:
         needle = f"%{query.strip()}%"
         with self._connect() as db:
             tasks = list(db.execute("SELECT * FROM tasks WHERE user_id=? AND title LIKE ? ORDER BY id DESC", (user_id,needle)))
-            notes = list(db.execute("SELECT * FROM notes WHERE user_id=? AND (body LIKE ? OR tags LIKE ?) ORDER BY id DESC", (user_id,needle,needle)))
+            notes = list(db.execute("SELECT * FROM notes WHERE user_id=? AND (body LIKE ? OR tags LIKE ?) ORDER BY important DESC,id DESC", (user_id,needle,needle)))
         return tasks, notes
 
     def due_reminders(self, now: datetime) -> list[sqlite3.Row]:

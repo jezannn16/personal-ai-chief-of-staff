@@ -65,7 +65,24 @@ def test_reminder_claim_column_migrates_existing_database(tmp_path):
     with store._connect() as db:
         columns = {row[1] for row in db.execute("PRAGMA table_info(reminders)")}
         assert "attempt_started_at" in columns
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 2
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 3
+
+
+def test_important_note_column_migrates_legacy_rows_and_is_user_scoped(tmp_path):
+    path=tmp_path/"legacy-notes.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE notes(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,body TEXT NOT NULL,tags TEXT NOT NULL DEFAULT '',created_at TEXT NOT NULL)")
+        db.execute("INSERT INTO notes(user_id,body,tags,created_at) VALUES(1,'Old note','work','2026-01-01T00:00:00+00:00')")
+    store=Store(path)
+    _,notes=store.search(1,"Old note")
+    assert notes[0]["important"]==0
+    important_id=store.add_note(1,"Important",important=True)
+    assert store.set_note_important(2,important_id,False) is False
+    assert store.set_note_important(1,important_id,False) is True
+    _,notes=Store(path).search(1,"Important")
+    assert notes[0]["important"]==0
+    with store._connect() as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0]==3
 
 
 def test_daily_briefing_delivery_is_once_per_user_local_date(tmp_path):

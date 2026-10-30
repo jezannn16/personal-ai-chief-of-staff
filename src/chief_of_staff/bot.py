@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shlex
 import time
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
@@ -41,6 +42,28 @@ def configure_intent_provider(enabled: str, api_key: str, model: str) -> IntentP
     if not api_key.strip() or not model.strip():
         raise ValueError("OPENAI_ENABLED requires OPENAI_API_KEY and OPENAI_MODEL")
     return OpenAIIntentProvider(api_key.strip(), model.strip())
+
+
+def parse_task_command(text: str) -> tuple[str, str | None, int]:
+    """Parse optional leading project/priority switches while keeping plain text tasks simple."""
+    try:
+        parts=shlex.split(text)
+    except ValueError as exc:
+        raise ValueError("Проверьте кавычки в команде /add.") from exc
+    project=None;priority=0
+    while parts and parts[0].startswith("--"):
+        option=parts.pop(0)
+        if option not in {"--project", "--priority"} or not parts:
+            raise ValueError("Формат: /add [--project название] [--priority 0..3] текст задачи")
+        value=parts.pop(0)
+        if option=="--project":project=value.strip() or None
+        else:
+            try:priority=int(value)
+            except ValueError as exc:raise ValueError("Priority должен быть целым числом 0..3.") from exc
+            if not 0<=priority<=3:raise ValueError("Priority должен быть целым числом 0..3.")
+    title=" ".join(parts).strip()
+    if not title:raise ValueError("Добавьте текст задачи после параметров.")
+    return title,project,priority
 
 
 async def deliver_daily_briefing(bot: Bot, store: Store, user_id: int, now: datetime,
@@ -82,7 +105,7 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
     @dp.message(Command("help"))
     async def help_cmd(message: Message) -> None:
         if await allowed(message):
-            await message.answer("/add текст задачи | /add YYYY-MM-DD HH:MM | задача\n/note текст #тег\n/ai <запрос> — optional LLM preview; изменения только после подтверждения\n/today, /inbox, /done ID, /search слова, /briefing\n/reminders, /cancelreminder ID\n/timezone Europe/Moscow\n/quiet 23 8")
+            await message.answer("/add [--project название] [--priority 0..3] текст задачи\n/add YYYY-MM-DD HH:MM | задача\n/note [--important] текст #тег\n/note-important ID on|off\n/ai <запрос> — optional LLM preview; изменения только после подтверждения\n/today, /inbox, /done ID, /search слова, /briefing\n/reminders, /cancelreminder ID\n/timezone Europe/Moscow\n/quiet 23 8")
 
     @dp.message(Command("add"))
     async def add(message: Message) -> None:
@@ -91,7 +114,10 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
         if not text:
             await message.answer("Использование: /add текст задачи или /add YYYY-MM-DD HH:MM | задача")
             return
-        due = None
+        project=None;priority=0;due = None
+        if not text.startswith("20") or " | " not in text:
+            try:text,project,priority=parse_task_command(text)
+            except ValueError as exc:await message.answer(str(exc));return
         if " | " in text:
             when, text = text.split(" | ",1)
             try:
@@ -101,7 +127,7 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
                 await message.answer("Дата должна быть в формате YYYY-MM-DD HH:MM и существовать в вашей timezone.")
                 return
         try:
-            task_id = store.add_task(message.from_user.id, text, due)
+            task_id = store.add_task(message.from_user.id, text, due,project,priority)
         except ValueError as exc:
             await message.answer(str(exc)); return
         await message.answer(f"Добавлено: #{task_id} {text}" + (f" — {due.isoformat()}" if due else ""))
@@ -110,12 +136,25 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
     async def note(message: Message) -> None:
         if not await allowed(message): return
         text = (message.text or "").partition(" ")[2].strip()
+        important=text.startswith("--important ")
+        if important:text=text.removeprefix("--important ").strip()
         tags = [word[1:] for word in text.split() if word.startswith("#")]
         try:
-            note_id = store.add_note(message.from_user.id, text, tags)
+            note_id = store.add_note(message.from_user.id, text, tags,important)
         except ValueError as exc:
             await message.answer(str(exc)); return
-        await message.answer(f"Заметка сохранена: #{note_id}")
+        await message.answer(f"Заметка сохранена: #{note_id}"+(" (важная)" if important else ""))
+
+    @dp.message(Command("note-important"))
+    async def note_important(message: Message) -> None:
+        if not await allowed(message):return
+        parts=(message.text or "").split()
+        if len(parts)!=3 or parts[2].lower() not in {"on","off"}:
+            await message.answer("Формат: /note-important ID on|off");return
+        try:note_id=int(parts[1])
+        except ValueError:await message.answer("ID заметки должен быть числом.");return
+        changed=store.set_note_important(message.from_user.id,note_id,parts[2].lower()=="on")
+        await message.answer("Важность заметки обновлена." if changed else "Заметка не найдена.")
 
     async def show_tasks(message: Message, title: str) -> None:
         if not await allowed(message): return
@@ -215,12 +254,15 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
             if due.date() < now.date(): overdue.append(row)
             elif due.date() == now.date(): today_rows.append(row)
             elif (due-now).days < 8: upcoming.append(row)
-        notes=store.search(uid,"")[1][:5]
+        notes=store.search(uid,"")[1]
+        important_notes=[n for n in notes if n["important"]][:5]
+        recent_notes=[n for n in notes if not n["important"]][:5]
         sections=[("Просрочено",overdue),("Сегодня",today_rows),("Ближайшие дедлайны",upcoming)]
         out=[]
         for label,items in sections:
             out.append(label+":"+("\n"+"\n".join(format_task(x, store.get_timezone(uid)) for x in items) if items else " нет"))
-        if notes: out.append("Заметки:\n"+"\n".join(f"#{n['id']} {n['body']}" for n in notes))
+        if important_notes:out.append("Важные заметки:\n"+"\n".join(f"#{n['id']} {n['body']}" for n in important_notes))
+        if recent_notes: out.append("Последние заметки:\n"+"\n".join(f"#{n['id']} {n['body']}" for n in recent_notes))
         return "\n\n".join(out)
 
     @dp.message(Command("briefing"))

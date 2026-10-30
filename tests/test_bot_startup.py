@@ -2,10 +2,44 @@ import asyncio
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from aiogram.types import Chat, Message, Update, User
 
-from chief_of_staff.bot import briefing_due_date, create_app, deliver_daily_briefing
+from chief_of_staff.bot import (
+    briefing_due_date,
+    create_app,
+    deliver_daily_briefing,
+    parse_task_command,
+)
 from chief_of_staff.store import Store
+
+
+def test_task_cli_parser_supports_project_and_priority():
+    assert parse_task_command('--project "Interview prep" --priority 3 Prepare notes') == ("Prepare notes", "Interview prep", 3)
+    assert parse_task_command("Plain task")==("Plain task",None,0)
+    with pytest.raises(ValueError):parse_task_command("--priority 4 Invalid")
+
+
+def test_telegram_can_set_task_metadata_and_important_notes(tmp_path):
+    async def scenario():
+        store=Store(tmp_path/"metadata.sqlite3")
+        bot,dispatcher=create_app("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",{61},store)
+        def update(update_id,text):
+            message=Message(message_id=update_id,date=datetime.now(UTC),chat=Chat(id=61,type="private"),from_user=User(id=61,is_bot=False,first_name="Test"),text=text)
+            return Update(update_id=update_id,message=message)
+        try:
+            with patch("aiogram.client.bot.Bot.__call__",new_callable=AsyncMock) as telegram:
+                await dispatcher.feed_update(bot,update(1,"/add --project Lab --priority 3 Build demo"))
+                task=store.tasks(61)[0]
+                assert (task["title"],task["project"],task["priority"])==("Build demo","Lab",3)
+                await dispatcher.feed_update(bot,update(2,"/note --important Renew certificate #ops"))
+                note=store.search(61,"certificate")[1][0]
+                assert note["important"]==1 and note["tags"]=="ops"
+                await dispatcher.feed_update(bot,update(3,"/briefing"))
+                assert "Важные заметки" in telegram.await_args.args[0].text
+                assert "Renew certificate" in telegram.await_args.args[0].text
+        finally:await bot.session.close()
+    asyncio.run(scenario())
 
 
 def test_startup_schedules_reminder_loop(tmp_path):
