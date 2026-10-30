@@ -66,6 +66,29 @@ def test_plain_text_update_creates_persistent_task(tmp_path):
     asyncio.run(run_update())
 
 
+def test_allowlisted_user_is_rejected_in_group_to_prevent_private_data_leak(tmp_path):
+    async def run_update():
+        class MustNotCallProvider:
+            def interpret(self, *_args, **_kwargs):
+                raise AssertionError("group message must not reach the LLM")
+
+        store=Store(tmp_path/"group-chat.sqlite3")
+        bot,dispatcher=create_app("123456:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",{42},store,intent_provider=MustNotCallProvider())
+        update=Update(update_id=2,message=Message(message_id=7,date=datetime.now(UTC),
+            chat=Chat(id=-10042,type="supergroup"),from_user=User(id=42,is_bot=False,first_name="Owner"),
+            text="/ai add confidential note"))
+        try:
+            with patch("aiogram.client.bot.Bot.__call__",new_callable=AsyncMock) as call_bot:
+                await dispatcher.feed_update(bot,update)
+            call_bot.assert_awaited_once()
+            assert "только в приватном чате" in call_bot.await_args.args[0].text
+            assert store.search(42,"")==([],[])
+        finally:
+            await bot.session.close()
+
+    asyncio.run(run_update())
+
+
 def test_scheduled_briefing_uses_user_local_date_and_configured_hour():
     from datetime import datetime
 

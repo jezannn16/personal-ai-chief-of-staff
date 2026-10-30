@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
@@ -14,6 +15,9 @@ from dotenv import load_dotenv
 
 from .intent import Intent, IntentError, IntentProvider, OpenAIIntentProvider, validate_intent
 from .store import Store
+
+PENDING_INTENT_TTL_SECONDS = 15 * 60
+MAX_PENDING_INTENTS = 1_000
 
 
 def format_task(row, timezone_name: str = "UTC") -> str:
@@ -59,9 +63,12 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
     if not 0 <= briefing_hour <= 23:
         raise ValueError("Briefing hour must be between 0 and 23")
     bot, dp = Bot(token=token), Dispatcher()
-    pending_intents: dict[str, tuple[int, Intent]] = {}
+    pending_intents: dict[str, tuple[int, Intent, float]] = {}
 
     async def allowed(message: Message) -> bool:
+        if message.chat.type != "private":
+            await message.answer("Личный inbox работает только в приватном чате с ботом.")
+            return False
         if not message.from_user or message.from_user.id not in allowlist:
             await message.answer("Доступ закрыт. Попросите владельца добавить ваш Telegram ID в ALLOWED_USER_IDS.")
             return False
@@ -245,7 +252,14 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
             return
         uid=message.from_user.id
         key=f"{uid}:{message.message_id}"
-        pending_intents[key]=(uid,intent)
+        created_at=time.monotonic()
+        for expired_key, (_, _, created) in list(pending_intents.items()):
+            if created_at-created > PENDING_INTENT_TTL_SECONDS:
+                pending_intents.pop(expired_key,None)
+        if len(pending_intents) >= MAX_PENDING_INTENTS:
+            await message.answer("Слишком много ожидающих подтверждений. Подтвердите или отмените старое preview.")
+            return
+        pending_intents[key]=(uid,intent,created_at)
         if intent.action=="add_task":
             local_due=intent.due_at.astimezone(ZoneInfo(store.get_timezone(uid))).strftime("%Y-%m-%d %H:%M %Z") if intent.due_at else "без срока"
             preview=f"Задача: {intent.content}\nСрок: {local_due}"
@@ -257,14 +271,19 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
 
     @dp.callback_query(F.data.startswith("ai-confirm:"))
     async def confirm_ai_intent(call: CallbackQuery) -> None:
-        if not call.from_user or call.from_user.id not in allowlist:
+        if (not call.from_user or call.from_user.id not in allowlist
+                or not call.message or call.message.chat.type != "private"):
             await call.answer("Доступ закрыт",show_alert=True);return
         key=call.data.removeprefix("ai-confirm:");pending=pending_intents.get(key)
         if pending is None:
             await call.answer("Preview истёк или уже обработан",show_alert=True);return
         if pending[0]!=call.from_user.id:
             await call.answer("Это preview другого пользователя",show_alert=True);return
-        _,intent=pending_intents.pop(key)
+        _,intent,created_at=pending
+        if time.monotonic()-created_at > PENDING_INTENT_TTL_SECONDS:
+            pending_intents.pop(key,None)
+            await call.answer("Preview истёк; запросите новое распознавание",show_alert=True);return
+        pending_intents.pop(key,None)
         if intent.action=="add_task":
             task_id=store.add_task(call.from_user.id,intent.content,intent.due_at)
             response=f"Задача #{task_id} сохранена."
@@ -276,7 +295,8 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
 
     @dp.callback_query(F.data.startswith("ai-cancel:"))
     async def cancel_ai_intent(call: CallbackQuery) -> None:
-        if not call.from_user or call.from_user.id not in allowlist:
+        if (not call.from_user or call.from_user.id not in allowlist
+                or not call.message or call.message.chat.type != "private"):
             await call.answer("Доступ закрыт",show_alert=True);return
         key=call.data.removeprefix("ai-cancel:");pending=pending_intents.get(key)
         if pending and pending[0]!=call.from_user.id:

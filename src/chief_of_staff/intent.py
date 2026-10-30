@@ -134,10 +134,30 @@ class OpenAIIntentProvider:
         try:
             response = self.transport(self.URL, headers, json.dumps(payload).encode(), self.timeout)
             decoded = json.loads(response)
-            output = decoded.get("output_text")
-            if not isinstance(output, str) or not output:
+            if not isinstance(decoded, dict) or decoded.get("status") != "completed":
+                raise IntentError("LLM не завершил ответ; данные не изменены.")
+            # `output_text` is an SDK convenience property, not the raw Responses
+            # REST shape returned by urllib. Read the documented output/content
+            # items and explicitly detect refusals that do not follow the schema.
+            output_items = decoded.get("output")
+            if not isinstance(output_items, list):
                 raise IntentError("LLM не вернул структурированный ответ.")
-            result = json.loads(output)
+            text_parts: list[str] = []
+            for item in output_items:
+                if not isinstance(item, dict) or item.get("type") != "message":
+                    continue
+                if item.get("role") != "assistant" or not isinstance(item.get("content"), list):
+                    continue
+                for part in item["content"]:
+                    if isinstance(part, dict) and part.get("type") == "refusal":
+                        raise IntentError("LLM отказал в обработке; данные не изменены.")
+                    if isinstance(part, dict) and part.get("type") == "output_text":
+                        text = part.get("text")
+                        if isinstance(text, str):
+                            text_parts.append(text)
+            if len(text_parts) != 1 or not text_parts[0]:
+                raise IntentError("LLM не вернул структурированный ответ.")
+            result = json.loads(text_parts[0])
             if not isinstance(result, dict):
                 raise IntentError("LLM вернул некорректную структуру.")
             return result
