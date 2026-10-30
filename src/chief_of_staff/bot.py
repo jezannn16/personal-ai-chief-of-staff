@@ -29,6 +29,21 @@ def briefing_due_date(now: datetime, timezone_name: str, send_hour: int) -> str 
     return local.date().isoformat() if local.hour == send_hour else None
 
 
+async def deliver_daily_briefing(bot: Bot, store: Store, user_id: int, now: datetime,
+                                 send_hour: int, render) -> bool:
+    """Claim once per local date; never retry an uncertain Telegram send automatically."""
+    local_date = briefing_due_date(now, store.get_timezone(user_id), send_hour)
+    if local_date is None or not store.claim_daily_briefing(user_id, local_date):
+        return False
+    try:
+        await bot.send_message(user_id, render(user_id, now))
+    except (TimeoutError, TelegramAPIError, OSError):
+        store.finish_daily_briefing(user_id, local_date, False)
+        return False
+    store.finish_daily_briefing(user_id, local_date, True)
+    return True
+
+
 def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int = 8) -> tuple[Bot, Dispatcher]:
     if not 0 <= briefing_hour <= 23:
         raise ValueError("Briefing hour must be between 0 and 23")
@@ -230,15 +245,7 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
                 except (TimeoutError, TelegramAPIError, OSError) as exc:  # no retry after an uncertain delivery result
                     store.finish_reminder(row["id"],False,type(exc).__name__)
             for user_id in allowlist:
-                local_date = briefing_due_date(now,store.get_timezone(user_id),briefing_hour)
-                if not local_date or not store.claim_daily_briefing(user_id,local_date):
-                    continue
-                try:
-                    await bot.send_message(user_id,render_briefing(user_id,now))
-                except (TimeoutError,TelegramAPIError,OSError):
-                    store.finish_daily_briefing(user_id,local_date,False)
-                else:
-                    store.finish_daily_briefing(user_id,local_date,True)
+                await deliver_daily_briefing(bot,store,user_id,now,briefing_hour,render_briefing)
             await asyncio.sleep(30)
 
     async def start_reminder_loop() -> None:
