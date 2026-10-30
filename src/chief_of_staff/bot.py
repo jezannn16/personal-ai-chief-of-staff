@@ -9,9 +9,10 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot, Dispatcher, F
 from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import Command, CommandStart
-from aiogram.types import Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 
+from .intent import Intent, IntentError, IntentProvider, OpenAIIntentProvider, validate_intent
 from .store import Store
 
 
@@ -29,6 +30,15 @@ def briefing_due_date(now: datetime, timezone_name: str, send_hour: int) -> str 
     return local.date().isoformat() if local.hour == send_hour else None
 
 
+def configure_intent_provider(enabled: str, api_key: str, model: str) -> IntentProvider | None:
+    """Require explicit configuration opt-in as well as credentials."""
+    if enabled.strip().lower() not in {"1", "true", "yes"}:
+        return None
+    if not api_key.strip() or not model.strip():
+        raise ValueError("OPENAI_ENABLED requires OPENAI_API_KEY and OPENAI_MODEL")
+    return OpenAIIntentProvider(api_key.strip(), model.strip())
+
+
 async def deliver_daily_briefing(bot: Bot, store: Store, user_id: int, now: datetime,
                                  send_hour: int, render) -> bool:
     """Claim once per local date; never retry an uncertain Telegram send automatically."""
@@ -44,10 +54,12 @@ async def deliver_daily_briefing(bot: Bot, store: Store, user_id: int, now: date
     return True
 
 
-def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int = 8) -> tuple[Bot, Dispatcher]:
+def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int = 8,
+               intent_provider: IntentProvider | None = None) -> tuple[Bot, Dispatcher]:
     if not 0 <= briefing_hour <= 23:
         raise ValueError("Briefing hour must be between 0 and 23")
     bot, dp = Bot(token=token), Dispatcher()
+    pending_intents: dict[str, tuple[int, Intent]] = {}
 
     async def allowed(message: Message) -> bool:
         if not message.from_user or message.from_user.id not in allowlist:
@@ -63,7 +75,7 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
     @dp.message(Command("help"))
     async def help_cmd(message: Message) -> None:
         if await allowed(message):
-            await message.answer("/add текст задачи | /add YYYY-MM-DD HH:MM | задача\n/note текст #тег\n/today, /inbox, /done ID, /search слова, /briefing\n/reminders, /cancelreminder ID\n/timezone Europe/Moscow\n/quiet 23 8")
+            await message.answer("/add текст задачи | /add YYYY-MM-DD HH:MM | задача\n/note текст #тег\n/ai <запрос> — optional LLM preview; изменения только после подтверждения\n/today, /inbox, /done ID, /search слова, /briefing\n/reminders, /cancelreminder ID\n/timezone Europe/Moscow\n/quiet 23 8")
 
     @dp.message(Command("add"))
     async def add(message: Message) -> None:
@@ -209,6 +221,70 @@ def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int
         if not await allowed(message): return
         await message.answer(render_briefing(message.from_user.id, datetime.now(UTC)))
 
+    @dp.message(Command("ai"))
+    async def ai_intent(message: Message) -> None:
+        if not await allowed(message): return
+        text=(message.text or "").partition(" ")[2].strip()
+        if intent_provider is None:
+            await message.answer("LLM отключён. Настройте OPENAI_API_KEY и OPENAI_MODEL либо используйте /add и /note.")
+            return
+        if not text:
+            await message.answer("Формат: /ai напомни завтра позвонить клиенту. LLM предложит preview, запись появится только после подтверждения.")
+            return
+        try:
+            timezone_name=store.get_timezone(message.from_user.id)
+            local_now=datetime.now(ZoneInfo(timezone_name))
+            raw=await asyncio.to_thread(intent_provider.interpret,text,timezone_name=timezone_name,now=local_now)
+            intent=validate_intent(raw)
+        except IntentError as exc:
+            await message.answer(str(exc));return
+        except Exception:  # noqa: BLE001 - fail closed for injected providers; never mutate on failure
+            await message.answer("Не удалось обработать запрос. Используйте /add или /note; данные не изменены.");return
+        if intent.action=="clarify":
+            await message.answer(intent.question)
+            return
+        uid=message.from_user.id
+        key=f"{uid}:{message.message_id}"
+        pending_intents[key]=(uid,intent)
+        if intent.action=="add_task":
+            local_due=intent.due_at.astimezone(ZoneInfo(store.get_timezone(uid))).strftime("%Y-%m-%d %H:%M %Z") if intent.due_at else "без срока"
+            preview=f"Задача: {intent.content}\nСрок: {local_due}"
+        else:
+            tags=("\nТеги: "+", ".join(intent.tags)) if intent.tags else ""
+            preview=f"Заметка: {intent.content}{tags}"
+        keyboard=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Подтвердить",callback_data=f"ai-confirm:{key}"),InlineKeyboardButton(text="Отмена",callback_data=f"ai-cancel:{key}")]])
+        await message.answer("Проверьте распознанное действие:\n"+preview+"\n\nНичего не сохранено до подтверждения.",reply_markup=keyboard)
+
+    @dp.callback_query(F.data.startswith("ai-confirm:"))
+    async def confirm_ai_intent(call: CallbackQuery) -> None:
+        if not call.from_user or call.from_user.id not in allowlist:
+            await call.answer("Доступ закрыт",show_alert=True);return
+        key=call.data.removeprefix("ai-confirm:");pending=pending_intents.get(key)
+        if pending is None:
+            await call.answer("Preview истёк или уже обработан",show_alert=True);return
+        if pending[0]!=call.from_user.id:
+            await call.answer("Это preview другого пользователя",show_alert=True);return
+        _,intent=pending_intents.pop(key)
+        if intent.action=="add_task":
+            task_id=store.add_task(call.from_user.id,intent.content,intent.due_at)
+            response=f"Задача #{task_id} сохранена."
+        else:
+            note_id=store.add_note(call.from_user.id,intent.content,list(intent.tags))
+            response=f"Заметка #{note_id} сохранена."
+        if call.message: await call.message.edit_text(response)
+        await call.answer()
+
+    @dp.callback_query(F.data.startswith("ai-cancel:"))
+    async def cancel_ai_intent(call: CallbackQuery) -> None:
+        if not call.from_user or call.from_user.id not in allowlist:
+            await call.answer("Доступ закрыт",show_alert=True);return
+        key=call.data.removeprefix("ai-cancel:");pending=pending_intents.get(key)
+        if pending and pending[0]!=call.from_user.id:
+            await call.answer("Это preview другого пользователя",show_alert=True);return
+        pending_intents.pop(key,None)
+        if call.message: await call.message.edit_text("Предложенное действие отменено; данные не изменены.")
+        await call.answer()
+
     @dp.message(F.text & ~F.text.startswith("/"))
     async def add_plain_text(message: Message) -> None:
         """Treat an ordinary message as a task, keeping slash commands explicit."""
@@ -269,7 +345,11 @@ def main() -> None:
         if not 0<=briefing_hour<=23: raise ValueError
     except ValueError as exc:
         raise SystemExit("BRIEFING_HOUR must be an integer from 0 to 23") from exc
-    bot,dp=create_app(token,allowed,store,briefing_hour)
+    try:
+        provider=configure_intent_provider(os.getenv("OPENAI_ENABLED", "false"),os.getenv("OPENAI_API_KEY", ""),os.getenv("OPENAI_MODEL", ""))
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    bot,dp=create_app(token,allowed,store,briefing_hour,provider)
     asyncio.run(dp.start_polling(bot))
 
 
