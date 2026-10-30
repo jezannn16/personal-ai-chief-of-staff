@@ -68,6 +68,16 @@ def test_reminder_claim_column_migrates_existing_database(tmp_path):
         assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 2
 
 
+def test_daily_briefing_delivery_is_once_per_user_local_date(tmp_path):
+    store = Store(tmp_path / "briefing.sqlite3")
+    assert store.claim_daily_briefing(10, "2026-10-30") is True
+    assert store.claim_daily_briefing(10, "2026-10-30") is False
+    assert store.claim_daily_briefing(11, "2026-10-30") is True
+    assert store.claim_daily_briefing(10, "2026-10-31") is True
+    store.finish_daily_briefing(10, "2026-10-30", True)
+    assert store.claim_daily_briefing(10, "2026-10-30") is False
+
+
 def test_user_settings_preserve_custom_values_on_restart(tmp_path):
     store=Store(tmp_path/"db.sqlite3")
     store.ensure_user_settings(1,"Europe/Moscow",22,7)

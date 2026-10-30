@@ -20,7 +20,18 @@ def format_task(row, timezone_name: str = "UTC") -> str:
     return f"#{row['id']} {row['title']}{due}"
 
 
-def create_app(token: str, allowlist: set[int], store: Store) -> tuple[Bot, Dispatcher]:
+def briefing_due_date(now: datetime, timezone_name: str, send_hour: int) -> str | None:
+    if now.tzinfo is None:
+        raise ValueError("Clock must be timezone-aware")
+    if not 0 <= send_hour <= 23:
+        raise ValueError("Briefing hour must be between 0 and 23")
+    local = now.astimezone(ZoneInfo(timezone_name))
+    return local.date().isoformat() if local.hour == send_hour else None
+
+
+def create_app(token: str, allowlist: set[int], store: Store, briefing_hour: int = 8) -> tuple[Bot, Dispatcher]:
+    if not 0 <= briefing_hour <= 23:
+        raise ValueError("Briefing hour must be between 0 and 23")
     bot, dp = Bot(token=token), Dispatcher()
 
     async def allowed(message: Message) -> bool:
@@ -161,10 +172,8 @@ def create_app(token: str, allowlist: set[int], store: Store) -> tuple[Bot, Disp
             "Напоминание отменено." if changed else "Активное напоминание с таким ID не найдено."
         )
 
-    @dp.message(Command("briefing"))
-    async def briefing(message: Message) -> None:
-        if not await allowed(message): return
-        uid=message.from_user.id; tz=ZoneInfo(store.get_timezone(uid)); now=datetime.now(tz)
+    def render_briefing(uid: int, now: datetime) -> str:
+        tz=ZoneInfo(store.get_timezone(uid)); now=now.astimezone(tz)
         rows=store.tasks(uid); overdue=[]; today_rows=[]; upcoming=[]
         for row in rows:
             if not row["due_at"]: continue
@@ -178,7 +187,12 @@ def create_app(token: str, allowlist: set[int], store: Store) -> tuple[Bot, Disp
         for label,items in sections:
             out.append(label+":"+("\n"+"\n".join(format_task(x, store.get_timezone(uid)) for x in items) if items else " нет"))
         if notes: out.append("Заметки:\n"+"\n".join(f"#{n['id']} {n['body']}" for n in notes))
-        await message.answer("\n\n".join(out))
+        return "\n\n".join(out)
+
+    @dp.message(Command("briefing"))
+    async def briefing(message: Message) -> None:
+        if not await allowed(message): return
+        await message.answer(render_briefing(message.from_user.id, datetime.now(UTC)))
 
     @dp.message(F.text & ~F.text.startswith("/"))
     async def add_plain_text(message: Message) -> None:
@@ -215,6 +229,16 @@ def create_app(token: str, allowlist: set[int], store: Store) -> tuple[Bot, Disp
                     store.finish_reminder(row["id"],True)
                 except (TimeoutError, TelegramAPIError, OSError) as exc:  # no retry after an uncertain delivery result
                     store.finish_reminder(row["id"],False,type(exc).__name__)
+            for user_id in allowlist:
+                local_date = briefing_due_date(now,store.get_timezone(user_id),briefing_hour)
+                if not local_date or not store.claim_daily_briefing(user_id,local_date):
+                    continue
+                try:
+                    await bot.send_message(user_id,render_briefing(user_id,now))
+                except (TimeoutError,TelegramAPIError,OSError):
+                    store.finish_daily_briefing(user_id,local_date,False)
+                else:
+                    store.finish_daily_briefing(user_id,local_date,True)
             await asyncio.sleep(30)
 
     async def start_reminder_loop() -> None:
@@ -233,7 +257,12 @@ def main() -> None:
     store=Store(os.getenv("DATABASE_PATH","chief_of_staff.sqlite3"))
     for user_id in allowed:
         store.ensure_user_settings(user_id,os.getenv("USER_TIMEZONE","UTC"),int(os.getenv("QUIET_HOURS_START","23")),int(os.getenv("QUIET_HOURS_END","8")))
-    bot,dp=create_app(token,allowed,store)
+    try:
+        briefing_hour=int(os.getenv("BRIEFING_HOUR","8"))
+        if not 0<=briefing_hour<=23: raise ValueError
+    except ValueError as exc:
+        raise SystemExit("BRIEFING_HOUR must be an integer from 0 to 23") from exc
+    bot,dp=create_app(token,allowed,store,briefing_hour)
     asyncio.run(dp.start_polling(bot))
 
 

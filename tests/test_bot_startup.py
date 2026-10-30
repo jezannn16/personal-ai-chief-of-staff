@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, patch
 
 from aiogram.types import Chat, Message, Update, User
 
-from chief_of_staff.bot import create_app
+from chief_of_staff.bot import briefing_due_date, create_app
 from chief_of_staff.store import Store
 
 
@@ -64,3 +64,11 @@ def test_plain_text_update_creates_persistent_task(tmp_path):
             await bot.session.close()
 
     asyncio.run(run_update())
+
+
+def test_scheduled_briefing_uses_user_local_date_and_configured_hour():
+    from datetime import datetime
+
+    now = datetime(2026, 10, 30, 5, 0, tzinfo=UTC)
+    assert briefing_due_date(now, "Europe/Moscow", 8) == "2026-10-30"
+    assert briefing_due_date(now, "Europe/Moscow", 9) is None
