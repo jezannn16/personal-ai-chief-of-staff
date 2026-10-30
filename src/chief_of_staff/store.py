@@ -1,8 +1,9 @@
 """SQLite persistence and user-scoped task operations."""
 from __future__ import annotations
 
+import os
 import sqlite3
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -13,10 +14,23 @@ class Store:
         self._init_db()
 
     def _connect(self) -> sqlite3.Connection:
+        if self.path != ":memory:":
+            fd = os.open(self.path, os.O_CREAT | os.O_RDWR, 0o600)
+            os.close(fd)
         db = sqlite3.connect(self.path, timeout=10)
+        self._secure_database_permissions()
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA foreign_keys = ON")
         return db
+
+    def _secure_database_permissions(self) -> None:
+        if self.path == ":memory:":
+            return
+        for candidate in (self.path, self.path + "-wal", self.path + "-shm", self.path + "-journal"):
+            try:
+                os.chmod(candidate, 0o600)
+            except FileNotFoundError:
+                continue
 
     def _init_db(self) -> None:
         with self._connect() as db:
@@ -36,6 +50,7 @@ class Store:
               due_at TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'pending'
                 CHECK(state IN ('pending','sending','sent','cancelled')),
               attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT,
+              attempt_started_at TEXT,
               UNIQUE(task_id), FOREIGN KEY(task_id) REFERENCES tasks(id)
             );
             CREATE TABLE IF NOT EXISTS reminder_delivery_log (
@@ -50,6 +65,10 @@ class Store:
             INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,CURRENT_TIMESTAMP);
             CREATE TABLE IF NOT EXISTS daily_briefing_delivery(user_id INTEGER NOT NULL,local_date TEXT NOT NULL,state TEXT NOT NULL,sent_at TEXT,PRIMARY KEY(user_id,local_date));
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(reminders)")}
+            if "attempt_started_at" not in columns:
+                db.execute("ALTER TABLE reminders ADD COLUMN attempt_started_at TEXT")
+            db.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,CURRENT_TIMESTAMP)")
 
     @staticmethod
     def now() -> str:
@@ -167,11 +186,33 @@ class Store:
     def claim_reminder(self, reminder_id: int, user_id: int) -> bool:
         """Atomically claim one reminder; a claimed item is never auto-retried (at-most-once)."""
         with self._connect() as db:
-            cur = db.execute("UPDATE reminders SET state='sending',attempts=attempts+1 WHERE id=? AND user_id=? AND state='pending'", (reminder_id,user_id))
+            cur = db.execute("UPDATE reminders SET state='sending',attempts=attempts+1,attempt_started_at=? WHERE id=? AND user_id=? AND state='pending'", (self.now(),reminder_id,user_id))
             return bool(cur.rowcount)
 
     def finish_reminder(self, reminder_id: int, sent: bool, detail: str = "") -> None:
         outcome = "sent" if sent else "failed"
         with self._connect() as db:
-            db.execute("UPDATE reminders SET state=?,last_error=? WHERE id=? AND state='sending'", ("sent" if sent else "cancelled",None if sent else detail[:500],reminder_id))
+            db.execute("UPDATE reminders SET state=?,last_error=?,attempt_started_at=NULL WHERE id=? AND state='sending'", ("sent" if sent else "cancelled",None if sent else detail[:500],reminder_id))
             db.execute("INSERT INTO reminder_delivery_log(reminder_id,attempted_at,outcome,detail) VALUES(?,?,?,?)", (reminder_id,self.now(),outcome,detail[:500]))
+
+    def recover_uncertain_reminders(self, now: datetime, stale_after: timedelta = timedelta(minutes=10)) -> int:
+        """Close claims abandoned beyond the send timeout; preserve uncertainty instead of resending."""
+        if now.tzinfo is None or stale_after <= timedelta(0):
+            raise ValueError("Recovery clock must be aware and stale_after positive")
+        cutoff = (now.astimezone(UTC) - stale_after).isoformat()
+        detail = "Delivery outcome unknown after process interruption; not retried to avoid duplicates."
+        with self._connect() as db:
+            rows = list(db.execute(
+                "SELECT id FROM reminders WHERE state='sending' AND attempt_started_at IS NOT NULL AND attempt_started_at<=?",
+                (cutoff,),
+            ))
+            for row in rows:
+                db.execute(
+                    "UPDATE reminders SET state='cancelled',last_error=?,attempt_started_at=NULL WHERE id=? AND state='sending'",
+                    (detail, row["id"]),
+                )
+                db.execute(
+                    "INSERT INTO reminder_delivery_log(reminder_id,attempted_at,outcome,detail) VALUES(?,?,'unknown',?)",
+                    (row["id"], now.astimezone(UTC).isoformat(), detail),
+                )
+            return len(rows)

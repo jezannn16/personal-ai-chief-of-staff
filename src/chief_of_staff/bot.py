@@ -196,6 +196,7 @@ def create_app(token: str, allowlist: set[int], store: Store) -> tuple[Bot, Disp
     async def reminder_loop() -> None:
         while True:
             now=datetime.now(UTC)
+            store.recover_uncertain_reminders(now)
             for row in store.due_reminders(now):
                 tz=ZoneInfo(row["timezone"] or "UTC"); local=now.astimezone(tz); hour=local.hour
                 start=row["quiet_start"] if row["quiet_start"] is not None else int(os.getenv("QUIET_HOURS_START","23"))

@@ -1,4 +1,6 @@
-from datetime import UTC, datetime
+import sqlite3
+from datetime import UTC, datetime, timedelta
+from stat import S_IMODE
 
 import pytest
 
@@ -29,6 +31,41 @@ def test_invalid_values(tmp_path):
     with pytest.raises(ValueError): store.add_task(1,"x",datetime(2030,1,1))
     with pytest.raises(ValueError): store.set_timezone(1,"No/Such_Zone")
     with pytest.raises(ValueError): store.set_quiet_hours(1,25,8)
+
+
+def test_database_file_is_private_by_default(tmp_path):
+    path = tmp_path / "private.sqlite3"
+    Store(path)
+    assert S_IMODE(path.stat().st_mode) == 0o600
+
+
+def test_stale_reminder_claim_is_recorded_without_duplicate_resend(tmp_path):
+    path = tmp_path / "db.sqlite3"
+    store = Store(path)
+    task_id = store.add_task(5, "Synthetic reminder", datetime(2030, 1, 1, tzinfo=UTC))
+    reminder = store.reminders(5)[0]
+    assert store.claim_reminder(reminder["id"], 5)
+    clock = datetime.now(UTC) + timedelta(minutes=11)
+    assert Store(path).recover_uncertain_reminders(clock) == 1
+    restarted = Store(path)
+    assert restarted.recover_uncertain_reminders(clock) == 0
+    assert restarted.reminders(5) == []
+    with restarted._connect() as db:
+        row = db.execute("SELECT state,last_error FROM reminders WHERE task_id=?", (task_id,)).fetchone()
+        log = db.execute("SELECT outcome,detail FROM reminder_delivery_log WHERE reminder_id=?", (reminder["id"],)).fetchone()
+    assert row["state"] == "cancelled" and "outcome unknown" in row["last_error"]
+    assert log["outcome"] == "unknown" and "not retried" in log["detail"]
+
+
+def test_reminder_claim_column_migrates_existing_database(tmp_path):
+    path = tmp_path / "legacy.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute("CREATE TABLE reminders(id INTEGER PRIMARY KEY,user_id INTEGER NOT NULL,task_id INTEGER NOT NULL,due_at TEXT NOT NULL,state TEXT NOT NULL DEFAULT 'pending',attempts INTEGER NOT NULL DEFAULT 0,last_error TEXT,UNIQUE(task_id))")
+    store = Store(path)
+    with store._connect() as db:
+        columns = {row[1] for row in db.execute("PRAGMA table_info(reminders)")}
+        assert "attempt_started_at" in columns
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 2
 
 
 def test_user_settings_preserve_custom_values_on_restart(tmp_path):
